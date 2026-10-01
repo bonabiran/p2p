@@ -235,7 +235,13 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;ba
         <span id="roomCodeText" class="code-text">-----</span>
         <button class="copy-btn" id="copyCodeBtn">کپی</button>
       </div>
-      <p class="sub" style="text-align:center; margin-top:8px;">منتظر اتصال طرف مقابل...</p>
+      <p class="sub" style="margin:10px 0 6px;">یا این لینک را بفرست (با یک کلیک وارد می‌شود):</p>
+      <div class="code-display" style="padding:10px 12px;gap:8px;margin-top:0">
+        <span id="roomLinkText" style="direction:ltr;text-align:left;font-size:12px;word-break:break-all;flex:1;font-weight:600"></span>
+        <button class="copy-btn" id="copyLinkBtn">کپی لینک</button>
+      </div>
+      <button id="shareLinkBtn" class="btn primary" style="margin-top:8px">📤 اشتراک‌گذاری لینک</button>
+      <p class="sub" style="text-align:center; margin-top:10px;">منتظر اتصال طرف مقابل...</p>
       <button id="importFromSetup" class="btn ghost" style="margin-top:12px;">📥 بازیابی چت از فایل</button>
     </div>
   </div>
@@ -1062,117 +1068,141 @@ function setupConnection(c){
     beep(1000,.1,.05);toast('اتصال برقرار شد ✓');
   });
   conn.on('data',handleIncoming);
-  conn.on('close',()=>{setOnline(false);helloReceived=false;remotePeerId=null;cleanupCall(null);addSystem('طرف مقابل قطع شد');toast('ارتباط قطع شد');});
-  conn.on('error',err=>toast('خطای اتصال: '+(err.message||err.type||'نامشخص')));
+  conn.on('close',()=>{if(conn!==c)return;setOnline(false);helloReceived=false;remotePeerId=null;cleanupCall(null);addSystem('طرف مقابل قطع شد');toast('ارتباط قطع شد');});
+  conn.on('error',err=>conn===c&&toast('خطای اتصال: '+(err.message||err.type||'نامشخص')));
 }
 
-async function createRoom(){
+const MAX_TRIES = 4, SERVER_TIMEOUT = 12000, HOST_TIMEOUT = 20000;
+// اگر سرور اختصاصی PeerJS داری اینجا بگذار؛ مثلا: { host:'my-peer.onrender.com', port:443, path:'/', secure:true }
+const CUSTOM_SERVER = null;
+let peerKeepInt = null;
+function peerOpts(){ return CUSTOM_SERVER ? Object.assign({}, PEER_CFG, CUSTOM_SERVER) : PEER_CFG; }
+function peerErrMsg(err){
+  const t = err && err.type;
+  return t==='unavailable-id' ? 'کد تکراری'
+       : t==='peer-unavailable' ? 'اتاقی با این کد پیدا نشد'
+       : (t==='network'||t==='socket-error'||t==='socket-closed') ? 'خطای شبکه'
+       : t==='server-error' ? 'سرور خطا داد'
+       : t==='webrtc' ? 'خطای WebRTC' : 'خطا: '+t;
+}
+function resetBtns(){ $('createBtn').disabled=false; $('joinBtn').disabled=false; }
+function killPeer(){
+  clearTimeout(peerOpenTimeout); clearInterval(peerKeepInt);
+  const c=conn; conn=null;
+  try{ if(c) c.close(); }catch{}
+  try{ if(peer) peer.destroy(); }catch{}
+  peer=null;
+}
+function startKeepAlive(p){
+  clearInterval(peerKeepInt);
+  peerKeepInt=setInterval(()=>{
+    if(p!==peer||p.destroyed){ clearInterval(peerKeepInt); return; }
+    if(p.disconnected){ try{ p.reconnect(); }catch{} }
+  },4000);
+}
+
+function roomLink(){ return location.href.split('#')[0].split('?')[0] + '#' + roomCode; }
+async function copyText(t,okMsg){ try{ await navigator.clipboard.writeText(t); toast(okMsg); }catch{ prompt('کپی کن:',t); } }
+$('copyLinkBtn').onclick=()=>copyText(roomLink(),'لینک کپی شد ✓');
+$('shareLinkBtn').onclick=async()=>{
+  const url=roomLink();
+  if(navigator.share){ try{ await navigator.share({title:'چت خصوصی',text:'بیا توی چت خصوصی من:',url}); return; }catch(e){ if(e&&e.name==='AbortError') return; } }
+  copyText(url,'لینک کپی شد ✓');
+};
+
+function createRoom(tryNo){
+  tryNo = (typeof tryNo==='number') ? tryNo : 1;
   if (typeof Peer === 'undefined') { toast('کتابخانه PeerJS لود نشد. اینترنت را بررسی کن.'); return; }
+  $('createBtn').disabled = true; $('joinBtn').disabled = true;
+  if (tryNo===1){
+    showProgress();
+    myName=($('nameInput').value.trim()||'من').slice(0,20);
+    localStorage.setItem('msg_name',myName);
+  }
+  roomCode = genCode(); role = 'host';
+  logStep(tryNo>1 ? `اتصال به سرور (تلاش ${tryNo} از ${MAX_TRIES})...` : 'اتصال به سرور...');
+  killPeer();
+  let done = false;
+  const fail = msg => {
+    if (done) return; done = true; killPeer();
+    if (tryNo < MAX_TRIES){ logStep(msg+' — تلاش مجدد...','err'); setTimeout(()=>createRoom(tryNo+1),1200); }
+    else { logStep(msg+' — اینترنت/VPN را بررسی کن و دوباره امتحان کن','err'); toast(msg); resetBtns(); }
+  };
+  let p;
+  try { p = peer = new Peer(PREFIX + roomCode, peerOpts()); }
+  catch (e) { fail('ساخت اتصال ناموفق'); return; }
+  peerOpenTimeout = setTimeout(()=>fail('سرور پاسخ نداد'), SERVER_TIMEOUT);
 
-  $('createBtn').disabled = true;
-  $('joinBtn').disabled = true;
-  showProgress();
-
-  myName=($('nameInput').value.trim()||'من').slice(0,20);
-  localStorage.setItem('msg_name',myName);
-  roomCode=genCode();
-  role='host';
-
-  logStep('اتصال به سرور PeerJS...', 'pending');
-
-  try { peer = new Peer(PREFIX + roomCode, PEER_CFG); }
-  catch (e) { logStep('ساخت Peer ناموفق: ' + e.message, 'err'); $('createBtn').disabled=false; $('joinBtn').disabled=false; return; }
-
-  peerOpenTimeout = setTimeout(() => {
-    if (peer && !peer.open) {
-      logStep('تایم‌اوت: سرور PeerJS پاسخ نداد', 'err');
-      toast('سرور PeerJS پاسخ نداد. دوباره امتحان کن.');
-      try { peer.destroy(); } catch {}
-      $('createBtn').disabled=false; $('joinBtn').disabled=false;
-    }
-  }, 15000);
-
-  peer.on('open', () => {
+  p.on('open', () => {
+    if (p!==peer || done) return; done = true;
     clearTimeout(peerOpenTimeout);
-    logStep('متصل شد', 'ok');
-    logStep('آماده دریافت اتصال', 'ok');
+    logStep('متصل شد','ok'); logStep('آماده دریافت اتصال','ok');
     $('roomCodeText').textContent = roomCode;
+    $('roomLinkText').textContent = roomLink();
     $('roomInfo').style.display = 'block';
     setTimeout(hideProgress, 2000);
     toast('اتاق ساخته شد ✓');
+    startKeepAlive(p);
   });
-
-  peer.on('connection', c => {
+  p.on('connection', c => {
+    if (p!==peer) return;
     if (conn && conn.open) { c.close(); return; }
     setupConnection(c);
   });
-
-  peer.on('call', handleIncomingCall);
-
-  peer.on('error', err => {
-    clearTimeout(peerOpenTimeout);
-    const msg = err.type === 'unavailable-id' ? 'کد تکراری — تلاش مجدد'
-              : err.type === 'network' ? 'خطای شبکه — اتصال اینترنت را بررسی کن'
-              : err.type === 'server-error' ? 'سرور PeerJS خطا داد — چند لحظه بعد دوباره تلاش کن'
-              : 'خطا: ' + err.type;
-    logStep(msg, 'err'); toast(msg);
-    if (err.type === 'unavailable-id') { try { peer.destroy(); } catch {} setTimeout(createRoom, 300); }
-    else { $('createBtn').disabled=false; $('joinBtn').disabled=false; }
+  p.on('call', handleIncomingCall);
+  p.on('disconnected', () => { if (p===peer && done && !p.destroyed){ try{ p.reconnect(); }catch{} } });
+  p.on('error', err => {
+    if (p!==peer) return;
+    if (!done) return fail(peerErrMsg(err));
+    if (['network','server-error','socket-error','socket-closed'].includes(err.type)) { try{ p.reconnect(); }catch{} return; }
+    toast(peerErrMsg(err));
   });
 }
 
-async function joinRoom(){
+function joinRoom(tryNo){
+  tryNo = (typeof tryNo==='number') ? tryNo : 1;
   if (typeof Peer === 'undefined') { toast('کتابخانه PeerJS لود نشد. اینترنت را بررسی کن.'); return; }
+  const code = $('codeInput').value.replace(/[\s-]/g,'').toUpperCase();
+  if (code.length!==5) return toast('کد باید ۵ حرفی باشد');
+  $('createBtn').disabled = true; $('joinBtn').disabled = true;
+  if (tryNo===1){
+    showProgress();
+    myName=($('nameInput').value.trim()||'من').slice(0,20);
+    localStorage.setItem('msg_name',myName);
+  }
+  roomCode = code; role = 'guest';
+  logStep(tryNo>1 ? `اتصال به سرور (تلاش ${tryNo} از ${MAX_TRIES})...` : 'اتصال به سرور...');
+  killPeer();
+  let done = false, hostTimer = null;
+  const fail = (msg, delay) => {
+    if (done) return; done = true; clearTimeout(hostTimer); killPeer();
+    if (tryNo < MAX_TRIES){ logStep(msg+' — تلاش مجدد...','err'); setTimeout(()=>joinRoom(tryNo+1), delay||1200); }
+    else { logStep(msg+' — مطمئن شو میزبان آنلاین است و کد درست است','err'); toast(msg); resetBtns(); }
+  };
+  let p;
+  try { p = peer = new Peer(peerOpts()); }
+  catch (e) { fail('ساخت اتصال ناموفق'); return; }
+  peerOpenTimeout = setTimeout(()=>fail('سرور پاسخ نداد'), SERVER_TIMEOUT);
 
-  const code=$('codeInput').value.trim().toUpperCase();
-  if(code.length!==5)return toast('کد باید ۵ حرفی باشد');
-
-  $('createBtn').disabled = true;
-  $('joinBtn').disabled = true;
-  showProgress();
-
-  myName=($('nameInput').value.trim()||'من').slice(0,20);
-  localStorage.setItem('msg_name',myName);
-  roomCode=code;
-  role='guest';
-
-  logStep('اتصال به سرور PeerJS...', 'pending');
-
-  try { peer = new Peer(PEER_CFG); }
-  catch (e) { logStep('ساخت Peer ناموفق: ' + e.message, 'err'); $('createBtn').disabled=false; $('joinBtn').disabled=false; return; }
-
-  peerOpenTimeout = setTimeout(() => {
-    if (peer && !peer.open) {
-      logStep('تایم‌اوت: سرور PeerJS پاسخ نداد', 'err');
-      toast('سرور PeerJS پاسخ نداد. دوباره امتحان کن.');
-      try { peer.destroy(); } catch {}
-      $('createBtn').disabled=false; $('joinBtn').disabled=false;
-    }
-  }, 15000);
-
-  peer.on('open', () => {
+  p.on('open', () => {
+    if (p!==peer || done) return;
     clearTimeout(peerOpenTimeout);
-    logStep('متصل شد', 'ok');
-    logStep('اتصال به میزبان...', 'pending');
-    const c = peer.connect(PREFIX + code, { reliable: true });
+    logStep('متصل شد','ok'); logStep('اتصال به میزبان...');
+    const c = p.connect(PREFIX + code, { reliable: true });
+    hostTimer = setTimeout(()=>{ if (!c.open) fail('اتصال به میزبان برقرار نشد'); }, HOST_TIMEOUT);
+    c.on('open', () => { if (done) return; done = true; clearTimeout(hostTimer); startKeepAlive(p); });
     setupConnection(c);
   });
-
-  peer.on('call', handleIncomingCall);
-
-  peer.on('error', err => {
-    clearTimeout(peerOpenTimeout);
-    const msg = err.type === 'peer-unavailable' ? 'اتاقی با این کد پیدا نشد'
-              : err.type === 'network' ? 'خطای شبکه — اتصال اینترنت را بررسی کن'
-              : err.type === 'server-error' ? 'سرور PeerJS خطا داد — دوباره تلاش کن'
-              : 'خطا: ' + err.type;
-    logStep(msg, 'err'); toast(msg);
-    $('createBtn').disabled=false; $('joinBtn').disabled=false;
+  p.on('call', handleIncomingCall);
+  p.on('error', err => {
+    if (p!==peer) return;
+    if (!done) return fail(peerErrMsg(err), err.type==='peer-unavailable' ? 2500 : 1200);
+    toast(peerErrMsg(err));
   });
 }
 
-$('createBtn').onclick=createRoom;
-$('joinBtn').onclick=joinRoom;
+$('createBtn').onclick=()=>createRoom(1);
+$('joinBtn').onclick=()=>joinRoom(1);
 $('codeInput').addEventListener('input',e=>{e.target.value=e.target.value.toUpperCase();});
 $('codeInput').addEventListener('keydown',e=>{if(e.key==='Enter')joinRoom();});
 $('copyCodeBtn').onclick=async()=>{try{await navigator.clipboard.writeText(roomCode);toast('کد کپی شد ✓');}catch{toast('کپی نشد');}};
@@ -1183,6 +1213,7 @@ $('leaveBtn').onclick=()=>{
   cleanupCall(null);
   try{if(conn)conn.close();}catch{}
   try{if(peer)peer.destroy();}catch{}
+  try{ history.replaceState(null,'',location.pathname+location.search); }catch{}
   location.reload();
 };
 
@@ -1191,6 +1222,19 @@ const savedName=localStorage.getItem('msg_name');
 if(savedName)$('nameInput').value=savedName;
 $('nameInput').addEventListener('change',e=>{localStorage.setItem('msg_name',e.target.value);});
 autoGrow();
+$('nameInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&$('codeInput').value.trim().length===5)joinRoom(1);});
+(function(){
+  const h=(location.hash||'').replace(/^#(room=)?/i,'').trim().toUpperCase();
+  if(h.length!==5) return;
+  $('codeInput').value=h;
+  if(savedName){
+    toast('در حال ورود به اتاق...');
+    (async()=>{ try{ await waitForPeerJS(); }catch{} joinRoom(1); })();
+  } else {
+    $('nameInput').focus();
+    toast('اسمت را بنویس و Enter بزن تا وارد اتاق شوی');
+  }
+})();
 
 })();
 </script>
